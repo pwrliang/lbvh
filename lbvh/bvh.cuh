@@ -248,6 +248,11 @@ class bvh
         this->construct();
     }
 
+    bvh(const thrust::device_vector<object_type>& objects)
+        : objects_d_(objects), query_host_enabled_(false) {
+        this->construct();
+    }
+
     bvh()                      = default;
     ~bvh()                     = default;
     bvh(const bvh&)            = default;
