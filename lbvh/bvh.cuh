@@ -239,16 +239,7 @@ class bvh
     using morton_code_calculator_type = MortonCodeCalculator;
 
   public:
-
-    template<typename InputIterator>
-    bvh(InputIterator first, InputIterator last, bool query_host_enabled = false)
-        : objects_h_(first, last), objects_d_(objects_h_),
-          query_host_enabled_(query_host_enabled)
-    {
-        this->construct();
-    }
-
-    bvh(const thrust::device_vector<object_type>& objects)
+    bvh(const thrust::device_vector<object_type>& objects, bool query_host_enabled = false)
         : objects_d_(objects), query_host_enabled_(false) {
         this->construct();
     }
@@ -265,7 +256,6 @@ class bvh
 
     void clear()
     {
-        this->objects_h_.clear();
         this->objects_d_.clear();
         this->aabbs_h_.clear();
         this->aabbs_.clear();
@@ -274,11 +264,9 @@ class bvh
         return ;
     }
 
-    template<typename InputIterator>
-    void assign(InputIterator first, InputIterator last)
+    void assign(const thrust::device_vector<object_type>& objects)
     {
-        this->objects_h_.assign(first, last);
-        this->objects_d_ = this->objects_h_;
+        this->objects_d_ = objects;
         this->construct();
         return;
     }
@@ -302,10 +290,9 @@ class bvh
 
     void construct()
     {
-        assert(objects_h_.size() == objects_d_.size());
-        if(objects_h_.size() == 0u) {return;}
+        if(objects_d_.size() == 0u) {return;}
 
-        const unsigned int num_objects        = objects_h_.size();
+        const unsigned int num_objects        = objects_d_.size();
         const unsigned int num_internal_nodes = num_objects - 1;
         const unsigned int num_nodes          = num_objects * 2 - 1;
 
@@ -450,8 +437,6 @@ class bvh
         return;
     }
 
-    thrust::host_vector<object_type> const& objects_host() const noexcept {return objects_h_;}
-    thrust::host_vector<object_type>&       objects_host()       noexcept {return objects_h_;}
     thrust::host_vector<node_type> const& nodes_host() const noexcept {return nodes_h_;}
     thrust::host_vector<node_type>&       nodes_host()       noexcept {return nodes_h_;}
     thrust::host_vector<aabb_type> const& aabbs_host() const noexcept {return aabbs_h_;}
@@ -459,7 +444,6 @@ class bvh
 
   private:
 
-    thrust::host_vector  <object_type>   objects_h_;
     thrust::device_vector<object_type>   objects_d_;
     thrust::host_vector  <aabb_type>     aabbs_h_;
     thrust::device_vector<aabb_type>     aabbs_;
