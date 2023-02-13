@@ -270,7 +270,18 @@ class bvh {
         aabbs_.data().get(), objects_d_.data().get()};
   }
 
-  void construct() {
+  void construct(bool profiling = false) {
+    std::chrono::high_resolution_clock::time_point t1, t2;
+    double t_alloc = 0, t_obj_to_aabb = 0, t_aabb_to_morton = 0;
+    double t_sort_aabb = 0, t_construct_internal_node = 0, t_create_aabb = 0;
+
+    auto to_ms = [](std::chrono::high_resolution_clock::time_point t1,
+                    std::chrono::high_resolution_clock::time_point t2) {
+      return std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1)
+                 .count() /
+             1000.0;
+    };
+
     if (objects_d_.size() == 0u) {
       return;
     }
@@ -291,8 +302,12 @@ class bvh {
     default_aabb.upper.z = -inf;
     default_aabb.lower.z = inf;
 
+    t1 = std::chrono::high_resolution_clock::now();
     this->aabbs_.resize(num_nodes, default_aabb);
+    t2 = std::chrono::high_resolution_clock::now();
+    t_alloc = to_ms(t1, t2);
 
+    t1 = std::chrono::high_resolution_clock::now();
     thrust::transform(this->objects_d_.begin(), this->objects_d_.end(),
                       aabbs_.begin() + num_internal_nodes, aabb_getter_type());
 
@@ -301,16 +316,29 @@ class bvh {
         [] __device__(const aabb_type& lhs, const aabb_type& rhs) {
           return merge(lhs, rhs);
         });
+    t2 = std::chrono::high_resolution_clock::now();
+    t_obj_to_aabb = to_ms(t1, t2);
 
+    t1 = std::chrono::high_resolution_clock::now();
     thrust::device_vector<unsigned int> morton(num_objects);
+    t2 = std::chrono::high_resolution_clock::now();
+    t_alloc += to_ms(t1, t2);
+
+    t1 = std::chrono::high_resolution_clock::now();
     thrust::transform(this->objects_d_.begin(), this->objects_d_.end(),
                       aabbs_.begin() + num_internal_nodes, morton.begin(),
                       morton_code_calculator_type(aabb_whole));
+    t2 = std::chrono::high_resolution_clock::now();
+    t_aabb_to_morton = to_ms(t1, t2);
 
     // --------------------------------------------------------------------
     // sort object-indices by morton code
-
+    t1 = std::chrono::high_resolution_clock::now();
     thrust::device_vector<unsigned int> indices(num_objects);
+    t2 = std::chrono::high_resolution_clock::now();
+    t_alloc += to_ms(t1, t2);
+
+    t1 = std::chrono::high_resolution_clock::now();
     thrust::copy(thrust::make_counting_iterator<index_type>(0),
                  thrust::make_counting_iterator<index_type>(num_objects),
                  indices.begin());
@@ -319,11 +347,17 @@ class bvh {
         morton.begin(), morton.end(),
         thrust::make_zip_iterator(thrust::make_tuple(
             aabbs_.begin() + num_internal_nodes, indices.begin())));
+    t2 = std::chrono::high_resolution_clock::now();
+    t_sort_aabb = to_ms(t1, t2);
 
     // --------------------------------------------------------------------
     // check morton codes are unique
-
+    t1 = std::chrono::high_resolution_clock::now();
     thrust::device_vector<unsigned long long int> morton64(num_objects);
+    t2 = std::chrono::high_resolution_clock::now();
+    t_alloc += to_ms(t1, t2);
+
+    t1 = std::chrono::high_resolution_clock::now();
     const auto uniqued =
         thrust::unique_copy(morton.begin(), morton.end(), morton64.begin());
 
@@ -338,6 +372,8 @@ class bvh {
             return m64;
           });
     }
+    t2 = std::chrono::high_resolution_clock::now();
+    t_aabb_to_morton += to_ms(t1, t2);
 
     // --------------------------------------------------------------------
     // construct leaf nodes and aabbs
@@ -347,8 +383,12 @@ class bvh {
     default_node.left_idx = 0xFFFFFFFF;
     default_node.right_idx = 0xFFFFFFFF;
     default_node.object_idx = 0xFFFFFFFF;
+    t1 = std::chrono::high_resolution_clock::now();
     this->nodes_.resize(num_nodes, default_node);
+    t2 = std::chrono::high_resolution_clock::now();
+    t_alloc += to_ms(t1, t2);
 
+    t1 = std::chrono::high_resolution_clock::now();
     thrust::transform(indices.begin(), indices.end(),
                       this->nodes_.begin() + num_internal_nodes,
                       [] __device__(const index_type idx) {
@@ -372,11 +412,17 @@ class bvh {
       const unsigned long long int* node_code = morton64.data().get();
       detail::construct_internal_nodes(self, node_code, num_objects);
     }
+    t2 = std::chrono::high_resolution_clock::now();
+    t_construct_internal_node = to_ms(t1, t2);
 
     // --------------------------------------------------------------------
     // create AABB for each node by bottom-up strategy
-
+    t1 = std::chrono::high_resolution_clock::now();
     thrust::device_vector<int> flag_container(num_internal_nodes, 0);
+    t2 = std::chrono::high_resolution_clock::now();
+    t_alloc += to_ms(t1, t2);
+
+    t1 = std::chrono::high_resolution_clock::now();
     const auto flags = flag_container.data().get();
 
     thrust::for_each(
@@ -408,6 +454,20 @@ class bvh {
           }
           return;
         });
+    t2 = std::chrono::high_resolution_clock::now();
+    t_create_aabb = to_ms(t1, t2);
+
+    if (profiling) {
+      double total = t_alloc + t_obj_to_aabb + t_aabb_to_morton + t_sort_aabb +
+                     t_construct_internal_node + t_create_aabb;
+      printf(
+          "LBVH Profiling result:\nAlloc: %.3lf\nObj to AABB: %.3lf\nAABB to "
+          "Morton Code: %.3lf\nSort "
+          "AABB: %.3lf\nConstruct Internal node: %.3lf\nCreate AABB: "
+          "%.3lf\nTotal: %.3lf\n",
+          t_alloc, t_obj_to_aabb, t_aabb_to_morton, t_sort_aabb,
+          t_construct_internal_node, t_create_aabb, total);
+    }
 
     if (this->query_host_enabled_) {
       aabbs_h_ = aabbs_;
@@ -431,7 +491,7 @@ class bvh {
   thrust::device_vector<aabb_type> aabbs_;
   thrust::host_vector<node_type> nodes_h_;
   thrust::device_vector<node_type> nodes_;
-  bool query_host_enabled_;
+  bool query_host_enabled_{};
 };
 
 }  // namespace lbvh
