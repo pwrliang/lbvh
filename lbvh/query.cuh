@@ -5,9 +5,9 @@
 
 namespace lbvh {
 template <typename Real, typename Objects, bool IsConst, typename FuncT>
-__device__ uint32_t
-query_device_all(const detail::basic_device_bvh<Real, Objects, IsConst>& bvh,
-                 const query_overlap<Real> q, FuncT f)
+__device__ thrust::pair<uint32_t, uint32_t> query_device_all(
+    const detail::basic_device_bvh<Real, Objects, IsConst>& bvh,
+    const query_overlap<Real> q, FuncT f)
 
     noexcept {
   using bvh_type = detail::basic_device_bvh<Real, Objects, IsConst>;
@@ -17,6 +17,7 @@ query_device_all(const detail::basic_device_bvh<Real, Objects, IsConst>& bvh,
   index_type* stack_ptr = stack;
   *stack_ptr++ = 0;  // root node is always 0
   uint32_t num_found = 0;
+  uint32_t traversed_nodes = 0;
 
   do {
     const index_type node = *--stack_ptr;
@@ -32,6 +33,7 @@ query_device_all(const detail::basic_device_bvh<Real, Objects, IsConst>& bvh,
       {
         *stack_ptr++ = L_idx;
       }
+      traversed_nodes++;
     }
     if (intersects(q.target, bvh.aabbs[R_idx])) {
       const auto obj_idx = bvh.nodes[R_idx].object_idx;
@@ -42,9 +44,10 @@ query_device_all(const detail::basic_device_bvh<Real, Objects, IsConst>& bvh,
       {
         *stack_ptr++ = R_idx;
       }
+      traversed_nodes++;
     }
   } while (stack < stack_ptr);
-  return num_found;
+  return thrust::make_pair(traversed_nodes, num_found);
 }
 
 // query object indices that potentially overlaps with query aabb.
