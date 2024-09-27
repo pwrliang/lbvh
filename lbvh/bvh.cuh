@@ -15,6 +15,7 @@
 #include <thrust/swap.h>
 #include <thrust/transform.h>
 #include <thrust/tuple.h>
+#include <thrust/unique.h>
 
 #include "aabb.cuh"
 #include "morton_code.cuh"
@@ -145,12 +146,43 @@ __device__ inline unsigned int find_split(UInt const* node_code,
 }
 template <typename Real, typename Object, bool IsConst, typename UInt>
 void construct_internal_nodes(
+    cudaStream_t stream, const basic_device_bvh<Real, Object, IsConst>& self,
+    UInt const* node_code, const unsigned int num_objects) {
+  thrust::for_each(
+      thrust::cuda::par.on(stream),
+      thrust::make_counting_iterator<unsigned int>(0),
+      thrust::make_counting_iterator<unsigned int>(num_objects - 1),
+      [self, node_code,
+       num_objects] __device__ __host__(const unsigned int idx) {
+        self.nodes[idx].object_idx = 0xFFFFFFFF;  //  internal nodes
+
+        const uint2 ij = determine_range(node_code, num_objects, idx);
+        const int gamma = find_split(node_code, num_objects, ij.x, ij.y);
+
+        self.nodes[idx].left_idx = gamma;
+        self.nodes[idx].right_idx = gamma + 1;
+        if (thrust::min(ij.x, ij.y) == gamma) {
+          self.nodes[idx].left_idx += num_objects - 1;
+        }
+        if (thrust::max(ij.x, ij.y) == gamma + 1) {
+          self.nodes[idx].right_idx += num_objects - 1;
+        }
+        self.nodes[self.nodes[idx].left_idx].parent_idx = idx;
+        self.nodes[self.nodes[idx].right_idx].parent_idx = idx;
+        return;
+      });
+  return;
+}
+
+template <typename Real, typename Object, bool IsConst, typename UInt>
+void construct_internal_nodes(
     const basic_device_bvh<Real, Object, IsConst>& self, UInt const* node_code,
     const unsigned int num_objects) {
   thrust::for_each(
       thrust::device, thrust::make_counting_iterator<unsigned int>(0),
       thrust::make_counting_iterator<unsigned int>(num_objects - 1),
-      [self, node_code, num_objects] __device__(const unsigned int idx) {
+      [self, node_code,
+       num_objects] __device__ __host__(const unsigned int idx) {
         self.nodes[idx].object_idx = 0xFFFFFFFF;  //  internal nodes
 
         const uint2 ij = determine_range(node_code, num_objects, idx);
@@ -218,7 +250,10 @@ class bvh {
   using aabb_getter_type = AABBGetter;
   using morton_code_calculator_type = MortonCodeCalculator;
   using pinned_vector = thrust::host_vector<
-      object_type, thrust::cuda::experimental::pinned_allocator<object_type>>;
+      object_type,
+      thrust::mr::stateless_resource_allocator<
+          object_type,
+          thrust::system::cuda::universal_host_pinned_memory_resource>>;
 
  public:
   bvh(const thrust::device_vector<object_type>& objects,
@@ -313,7 +348,7 @@ class bvh {
 
     const auto aabb_whole = thrust::reduce(
         aabbs_.begin() + num_internal_nodes, aabbs_.end(), default_aabb,
-        [] __device__(const aabb_type& lhs, const aabb_type& rhs) {
+        [] __device__ __host__(const aabb_type& lhs, const aabb_type& rhs) {
           return merge(lhs, rhs);
         });
     t2 = std::chrono::high_resolution_clock::now();
@@ -365,7 +400,7 @@ class bvh {
     if (!morton_code_is_unique) {
       thrust::transform(
           morton.begin(), morton.end(), indices.begin(), morton64.begin(),
-          [] __device__(const unsigned int m, const unsigned int idx) {
+          [] __device__ __host__(const unsigned int m, const unsigned int idx) {
             unsigned long long int m64 = m;
             m64 <<= 32;
             m64 |= idx;
@@ -391,7 +426,7 @@ class bvh {
     t1 = std::chrono::high_resolution_clock::now();
     thrust::transform(indices.begin(), indices.end(),
                       this->nodes_.begin() + num_internal_nodes,
-                      [] __device__(const index_type idx) {
+                      [] __device__ __host__(const index_type idx) {
                         node_type n;
                         n.parent_idx = 0xFFFFFFFF;
                         n.left_idx = 0xFFFFFFFF;
@@ -474,6 +509,158 @@ class bvh {
       nodes_h_ = nodes_;
     }
     return;
+  }
+
+  void construct(cudaStream_t stream) {
+    if (objects_d_.size() == 0u) {
+      return;
+    }
+
+    const unsigned int num_objects = objects_d_.size();
+    const unsigned int num_internal_nodes = num_objects - 1;
+    const unsigned int num_nodes = num_objects * 2 - 1;
+
+    // --------------------------------------------------------------------
+    // calculate morton code of each points
+
+    const auto inf = std::numeric_limits<real_type>::infinity();
+    aabb_type default_aabb;
+    default_aabb.upper.x = -inf;
+    default_aabb.lower.x = inf;
+    default_aabb.upper.y = -inf;
+    default_aabb.lower.y = inf;
+    default_aabb.upper.z = -inf;
+    default_aabb.lower.z = inf;
+
+    this->aabbs_.resize(num_nodes, default_aabb);
+
+    thrust::transform(thrust::cuda::par.on(stream), this->objects_d_.begin(),
+                      this->objects_d_.end(),
+                      aabbs_.begin() + num_internal_nodes, aabb_getter_type());
+
+    const auto aabb_whole = thrust::reduce(
+        thrust::cuda::par.on(stream), aabbs_.begin() + num_internal_nodes,
+        aabbs_.end(), default_aabb,
+        [] __device__ __host__(const aabb_type& lhs, const aabb_type& rhs) {
+          return merge(lhs, rhs);
+        });
+
+    thrust::device_vector<unsigned int> morton(num_objects);
+
+    thrust::transform(thrust::cuda::par.on(stream), this->objects_d_.begin(),
+                      this->objects_d_.end(),
+                      aabbs_.begin() + num_internal_nodes, morton.begin(),
+                      morton_code_calculator_type(aabb_whole));
+
+    // --------------------------------------------------------------------
+    // sort object-indices by morton code
+    thrust::device_vector<unsigned int> indices(num_objects);
+
+    thrust::copy(thrust::cuda::par.on(stream),
+                 thrust::make_counting_iterator<index_type>(0),
+                 thrust::make_counting_iterator<index_type>(num_objects),
+                 indices.begin());
+    // keep indices ascending order
+    thrust::stable_sort_by_key(
+        thrust::cuda::par.on(stream), morton.begin(), morton.end(),
+        thrust::make_zip_iterator(thrust::make_tuple(
+            aabbs_.begin() + num_internal_nodes, indices.begin())));
+
+    // --------------------------------------------------------------------
+    // check morton codes are unique
+    thrust::device_vector<unsigned long long int> morton64(num_objects);
+
+    const auto uniqued =
+        thrust::unique_copy(thrust::cuda::par.on(stream), morton.begin(),
+                            morton.end(), morton64.begin());
+
+    const bool morton_code_is_unique = (morton64.end() == uniqued);
+    if (!morton_code_is_unique) {
+      thrust::transform(
+          thrust::cuda::par.on(stream), morton.begin(), morton.end(),
+          indices.begin(), morton64.begin(),
+          [] __device__ __host__(const unsigned int m, const unsigned int idx) {
+            unsigned long long int m64 = m;
+            m64 <<= 32;
+            m64 |= idx;
+            return m64;
+          });
+    }
+
+    // --------------------------------------------------------------------
+    // construct leaf nodes and aabbs
+
+    node_type default_node;
+    default_node.parent_idx = 0xFFFFFFFF;
+    default_node.left_idx = 0xFFFFFFFF;
+    default_node.right_idx = 0xFFFFFFFF;
+    default_node.object_idx = 0xFFFFFFFF;
+    this->nodes_.resize(num_nodes, default_node);
+
+    thrust::transform(thrust::cuda::par.on(stream), indices.begin(),
+                      indices.end(), this->nodes_.begin() + num_internal_nodes,
+                      [] __device__ __host__(const index_type idx) {
+                        node_type n;
+                        n.parent_idx = 0xFFFFFFFF;
+                        n.left_idx = 0xFFFFFFFF;
+                        n.right_idx = 0xFFFFFFFF;
+                        n.object_idx = idx;
+                        return n;
+                      });
+
+    // --------------------------------------------------------------------
+    // construct internal nodes
+
+    const auto self = this->get_device_repr();
+    if (morton_code_is_unique) {
+      const unsigned int* node_code = morton.data().get();
+      detail::construct_internal_nodes(stream, self, node_code, num_objects);
+    } else  // 64bit version
+    {
+      const unsigned long long int* node_code = morton64.data().get();
+      detail::construct_internal_nodes(stream, self, node_code, num_objects);
+    }
+
+    // --------------------------------------------------------------------
+    // create AABB for each node by bottom-up strategy
+    thrust::device_vector<int> flag_container(num_internal_nodes, 0);
+
+    const auto flags = flag_container.data().get();
+
+    thrust::for_each(
+        thrust::cuda::par.on(stream),
+        thrust::make_counting_iterator<index_type>(num_internal_nodes),
+        thrust::make_counting_iterator<index_type>(num_nodes),
+        [self, flags] __device__(index_type idx) {
+          unsigned int parent = self.nodes[idx].parent_idx;
+          while (parent != 0xFFFFFFFF)  // means idx == 0
+          {
+            const int old = atomicCAS(flags + parent, 0, 1);
+            if (old == 0) {
+              // this is the first thread entered here.
+              // wait the other thread from the other child node.
+              return;
+            }
+            assert(old == 1);
+            // here, the flag has already been 1. it means that this
+            // thread is the 2nd thread. merge AABB of both childlen.
+
+            const auto lidx = self.nodes[parent].left_idx;
+            const auto ridx = self.nodes[parent].right_idx;
+            const auto lbox = self.aabbs[lidx];
+            const auto rbox = self.aabbs[ridx];
+            self.aabbs[parent] = merge(lbox, rbox);
+
+            // look the next parent...
+            parent = self.nodes[parent].parent_idx;
+          }
+          return;
+        });
+
+    if (this->query_host_enabled_) {
+      aabbs_h_ = aabbs_;
+      nodes_h_ = nodes_;
+    }
   }
 
   thrust::host_vector<node_type> const& nodes_host() const noexcept {
