@@ -286,6 +286,11 @@ class bvh {
     return;
   }
 
+  template <typename IT_T>
+  void assign(IT_T begin, IT_T end) {
+    this->objects_d_.assign(begin, end);
+  }
+
   void assign(const thrust::device_vector<object_type>& objects) {
     this->objects_d_ = objects;
   }
